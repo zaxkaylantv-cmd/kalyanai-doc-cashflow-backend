@@ -2,3 +2,7 @@ Vault Entry
 Ref: Archive
 Note: doc upload complete
 Timestamp: Sun Nov 30 01:12:14 GMT 2025
+---
+Ref: backend on pm2
+Note: backend running under pm2 with name kalyanai-cashflow-backend
+Timestamp: Sun Nov 30 11:35:18 GMT 2025
