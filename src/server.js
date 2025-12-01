@@ -54,64 +54,98 @@ app.get("/api/cashflow-summary", async (_req, res) => {
   try {
     const invoices = await getInvoices();
 
-    const totalOutstanding = invoices
-      .filter((inv) => inv.status !== "Paid")
-      .reduce((sum, inv) => sum + (Number(inv.amount) || 0), 0);
-    const totalPaid = invoices
-      .filter((inv) => inv.status === "Paid")
-      .reduce((sum, inv) => sum + (Number(inv.amount) || 0), 0);
-
-    const today = new Date();
-    const msInDay = 1000 * 60 * 60 * 24;
-    const daysDiff = (dateStr) => {
-      if (!dateStr) return null;
-      const d = new Date(dateStr);
-      if (isNaN(d.getTime())) return null;
-      return Math.floor((d.getTime() - today.getTime()) / msInDay);
+    const getInvoiceDueDate = (row) => {
+      const raw = row.dueDate || row.due_date;
+      if (!raw) return null;
+      const parsed = new Date(raw);
+      return isNaN(parsed.getTime()) ? null : parsed;
     };
 
-    const countOverdue = invoices.filter((inv) => {
-      const diff = daysDiff(inv.due_date || inv.dueDate);
-      return diff !== null && diff < 0 && inv.status !== "Paid";
-    }).length;
+    const isPaidStatus = (row) => {
+      const status = (row.status || "").trim().toLowerCase();
+      return status === "paid";
+    };
 
-    const countDueSoon = invoices.filter((inv) => {
-      const diff = daysDiff(inv.due_date || inv.dueDate);
-      return diff !== null && diff >= 0 && diff <= 7 && inv.status !== "Paid";
-    }).length;
+    const today = new Date();
+    const sevenDaysFromNow = new Date(today.getTime() + 7 * 24 * 60 * 60 * 1000);
+    const thirtyDaysFromNow = new Date(today.getTime() + 30 * 24 * 60 * 60 * 1000);
 
-    const metrics = { totalOutstanding, totalPaid, countOverdue, countDueSoon };
+    let totalPaid = 0;
+    let totalOutstanding = 0;
+    const overdueInvoices = [];
+    const dueSoonInvoices = [];
+    const next30Invoices = [];
 
-    const keyInvoices = [...invoices]
-      .filter((inv) => inv.status !== "Paid")
-      .sort((a, b) => (Number(b.amount) || 0) - (Number(a.amount) || 0))
-      .slice(0, 5)
-      .map((inv) => ({
-        supplier: inv.supplier,
-        amount: Number(inv.amount) || 0,
-        due: inv.due_date || inv.dueDate,
-        status: inv.status,
-      }));
+    invoices
+      .filter((inv) => inv.archived !== 1 && inv.archived !== true)
+      .forEach((inv) => {
+        const amount = Number(inv.amount) || 0;
+        const paid = isPaidStatus(inv);
+        const dueDate = getInvoiceDueDate(inv);
 
-    let summary = "AI summary is currently unavailable. Here are the raw metrics.";
+        if (paid) {
+          totalPaid += amount;
+          return;
+        }
+
+        totalOutstanding += amount;
+
+        if (!dueDate) return; // exclude from date-based buckets if no valid due date
+
+        if (dueDate < today) {
+          overdueInvoices.push(inv);
+        } else if (dueDate >= today && dueDate <= sevenDaysFromNow) {
+          dueSoonInvoices.push(inv);
+          next30Invoices.push(inv);
+        } else if (dueDate > sevenDaysFromNow && dueDate <= thirtyDaysFromNow) {
+          next30Invoices.push(inv);
+        }
+      });
+
+    const metrics = {
+      totalOutstanding,
+      totalPaid,
+      countOverdue: overdueInvoices.length,
+      countDueSoon: dueSoonInvoices.length,
+    };
+
+    let summary = "AI summary is temporarily unavailable. Metrics are still accurate.";
 
     if (aiClient) {
+      if (totalOutstanding === 0) {
+        return res.json({
+          metrics,
+          summary: "There are no outstanding invoices. Cashflow looks clear at the moment.",
+        });
+      }
+
+      const largestOverdue = [...overdueInvoices]
+        .sort((a, b) => (Number(b.amount) || 0) - (Number(a.amount) || 0))
+        .slice(0, 3)
+        .map((inv) => `${inv.supplier} — ${inv.amount} due ${inv.due_date || inv.dueDate || "unknown"}`);
+
+      const dueSoonList = [...dueSoonInvoices]
+        .sort((a, b) => (Number(b.amount) || 0) - (Number(a.amount) || 0))
+        .slice(0, 3)
+        .map((inv) => `${inv.supplier} — ${inv.amount} due ${inv.due_date || inv.dueDate || "unknown"}`);
+
+      const next30Total = next30Invoices.reduce((sum, inv) => sum + (Number(inv.amount) || 0), 0);
+
       const context = `
 Metrics:
 - Total outstanding (unpaid): ${totalOutstanding}
 - Total paid: ${totalPaid}
-- Overdue invoices: ${countOverdue}
-- Due in next 7 days: ${countDueSoon}
+- Overdue invoices: ${overdueInvoices.length}
+- Due in next 7 days: ${dueSoonInvoices.length}
+- Total due in next 30 days: ${next30Total}
 
-Key invoices (up to 5):
-${keyInvoices
-  .map(
-    (inv, idx) =>
-      `${idx + 1}. ${inv.supplier} — ${inv.amount} due ${inv.due || "unknown"} (${inv.status})`,
-  )
-  .join("\n")}
+Largest overdue (up to 3):
+${largestOverdue.map((t, i) => `${i + 1}. ${t}`).join("\n") || "None"}
 
-Write 2-4 concise bullet points (or 2-3 short sentences) about upcoming cash out, overdue risk, and any spikes in the next 30 days. Use ONLY the data provided; do not invent invoices or amounts.`;
+Due in next 7 days (up to 3):
+${dueSoonList.map((t, i) => `${i + 1}. ${t}`).join("\n") || "None"}
+
+Write 2-4 concise bullet points (or 2-3 short sentences) about upcoming cash out, overdue risk, and any spikes in the next 30 days. Use ONLY the data provided; do not invent invoices or amounts. Always express currency in GBP (£).`;
 
       try {
         const aiRes = await aiClient.chat.completions.create({
@@ -120,7 +154,7 @@ Write 2-4 concise bullet points (or 2-3 short sentences) about upcoming cash out
             {
               role: "system",
               content:
-                "You are a financial analyst helping a business owner understand upcoming supplier payments and cashflow risks. Be concise and practical.",
+                "You are a financial analyst helping a business owner understand upcoming supplier payments and cashflow risks. Be concise and practical. Always express currency in GBP (£), never in $.",
             },
             { role: "user", content: context },
           ],
